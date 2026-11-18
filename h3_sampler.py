@@ -33,8 +33,10 @@ v2 优化版变更 (输出不变项 / 行为变化项分开列出):
 """
 
 import math
+import os
 import re
 import torch
+import folder_paths
 from . import latent_cache
 import threading
 import hashlib
@@ -48,6 +50,7 @@ except ImportError:
 
 import comfy.sample
 import comfy.samplers
+import comfy.sd
 import comfy.model_management
 import comfy.utils
 
@@ -758,6 +761,16 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
     effective_new = [seg_sizes[0]] + [s - context_frames for s in seg_sizes[1:]]
     print(f"[H3-Auto] clip_mode={clip_mode}, segments={len(chunks)}, sampled={seg_sizes}, produced={effective_new}, total_frames={total_frames}\n[H3-Auto] clip_mode={clip_mode}, 段数={len(chunks)}, 实际采样={seg_sizes}, 实际输出={effective_new}, 总帧数={total_frames}")
 
+    # 段内 <lora:> 标签: 采样前全部解析, 名称写错时在第一段开跑前就报错
+    seg_loras = []
+    for i in range(len(chunks)):
+        _, tags = h3_utils.extract_lora_tags(prompt_getter(i))
+        seg_loras.append(tuple((_resolve_lora_name(name, i), s) for name, s in tags if s != 0))
+    if any(seg_loras):
+        for i, loras in enumerate(seg_loras):
+            desc = ", ".join(f"{n} ({s:g})" for n, s in loras) or "none / 无"
+            print(f"[H3-Auto] Segment {i+1} LoRA: {desc}\n[H3-Auto] 段 {i+1} LoRA: {desc}")
+
     # ==================== 二采切分（现在 seg_sizes 已知） ====================
     if is_second_pass:
         first_pass_segments = _split_first_pass_latent(
@@ -796,6 +809,8 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
           f"({'用户配置镜像' if _graph_fp_cache else '未获取hidden prompt, 已回退纯权重指纹'})")
 
     _REF_AUDIO_SLICE_CACHE.clear()
+    lora_files = {}
+    seg_models = {(): (model, _model_fp_cache)}
 
     overall_pbar = comfy.utils.ProgressBar(len(chunks) * (2 if decode_output else 1))
     
@@ -825,7 +840,11 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
     
         # ==================== 提示词构建 ====================
 
-        window_prompt = prompt_getter(idx)
+        window_prompt, _ = h3_utils.extract_lora_tags(prompt_getter(idx))
+        if seg_loras[idx] not in seg_models:
+            m = _apply_loras(model, seg_loras[idx], lora_files)
+            seg_models[seg_loras[idx]] = (m, latent_cache.model_fingerprint(m))
+        seg_model, seg_model_fp = seg_models[seg_loras[idx]]
         seg_ref_vid, seg_ref_aud = ref_vid_data, ref_aud_data
         # 切片编码前判定: 本段提示词未声明 <Video N>/<Audio N> (raw 格式豁免) 时跳过切片,
         _seg_declares_va = (prompt_format == "raw") or any(
@@ -957,7 +976,9 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
                 tail_denoise=tail_denoise)
     
         # ==================== 缓存逻辑 ====================
-        window_prompt_hash = hashlib.md5(window_prompt.encode('utf-8')).hexdigest()
+        # 段 LoRA 显式入键: model_fp 对补丁条目有 256 上限, 不能单靠它区分 LoRA/强度
+        _prompt_key = window_prompt + (repr(seg_loras[idx]) if seg_loras[idx] else "")
+        window_prompt_hash = hashlib.md5(_prompt_key.encode('utf-8')).hexdigest()
         
         if sigmas is not None:
             if isinstance(sigmas, torch.Tensor):
@@ -998,7 +1019,7 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
             "semantic_bridge_adapter": semantic_bridge_adapter if semantic_bridge else None,
             "semantic_bridge_alpha": float(semantic_bridge_alpha) if semantic_bridge else None,
             "semantic_bridge_magnitude": semantic_bridge_magnitude if semantic_bridge else None,
-            "model_fp": _model_fp_cache,
+            "model_fp": seg_model_fp,
             "vae_fp": _vae_fp_cache,
             "clip_fp": _clip_fp_cache,
             "graph_fp": _graph_fp_cache,
@@ -1050,7 +1071,7 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
         else:
             force_regenerate = True
             segment_latent = _sample_segment(
-                model, positive, seg_latent_dict, steps, cfg,
+                seg_model, positive, seg_latent_dict, steps, cfg,
                 sampler_name, scheduler, seed + idx,
                 denoise=denoise, sigmas=sigmas,
                 sampler_obj=sampler)
@@ -1098,7 +1119,7 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
         "upstream_global_hash": upstream_global_hash,
     }
     try:
-        seam_info["segment_prompts"] = [prompt_getter(i) for i in range(len(chunks))]
+        seam_info["segment_prompts"] = [h3_utils.extract_lora_tags(prompt_getter(i))[0] for i in range(len(chunks))]
     except Exception as _e:
         print(f"[H3-Auto] segment_prompts packaging failed: {_e}\n[H3-Auto] segment_prompts 打包失败: {_e}")
         seam_info["segment_prompts"] = []
@@ -1155,6 +1176,34 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
                                        total_frames, fps)
 
     return final_pixels, final_audio, final_latent, final_denoised, seam_info
+
+def _resolve_lora_name(name, seg_idx):
+    """<lora:> 名称 → loras 目录 (含 extra_model_paths) 下的相对路径。
+    依次比对: 完整路径 → 去扩展名 → 仅文件名 → 仅文件名去扩展名；同一层多个命中时报错不猜。"""
+    names = folder_paths.get_filename_list("loras")
+    key = name.replace("\\", "/").lower()
+    for norm in (lambda p: p, lambda p: os.path.splitext(p)[0],
+                 os.path.basename, lambda p: os.path.splitext(os.path.basename(p))[0]):
+        hits = [n for n in names if norm(n.replace("\\", "/")).lower() == key]
+        if len(hits) == 1:
+            return hits[0]
+        if hits:
+            raise ValueError(f"Segment {seg_idx+1}: LoRA '{name}' matches several files, write the full path: {hits}\n"
+                             f"段 {seg_idx+1}: LoRA '{name}' 匹配到多个文件, 请写完整路径: {hits}")
+    raise ValueError(f"Segment {seg_idx+1}: LoRA '{name}' not found in the loras folders\n"
+                     f"段 {seg_idx+1}: 在 loras 目录中找不到 LoRA '{name}'")
+
+
+def _apply_loras(model, loras, lora_files):
+    """等同串联 LoraLoaderModelOnly。lora_files 为本次运行内的文件缓存, 同一文件只读一次。"""
+    for name, strength in loras:
+        path = folder_paths.get_full_path_or_raise("loras", name)
+        if path not in lora_files:
+            lora_files[path] = comfy.utils.load_torch_file(path, safe_load=True, return_metadata=True)
+        lora, metadata = lora_files[path]
+        model, _ = comfy.sd.load_lora_for_models(model, None, lora, strength, 0, lora_metadata=metadata)
+    return model
+
 
 def _prepare_ref_images(ref_images, vae, device, gen_w, gen_h, crop_mode="stretch"):
     """预处理参考图片：按 crop_mode 缩放 + 32x 对齐 + VAE 编码"""

@@ -738,6 +738,30 @@ def get_prompt_for_window(segments, win_start_sec: float, win_end_sec: float) ->
 _TAG_TRAILING_SEPARATORS = ':：，,。；; \t—–-'
 _TAG_DURATION_PATTERN = re.compile(r'^\s*(\d+(?:\.\d+)?)\s*[s秒]\s*[:：\s]*')
 _TAG_BRACKET_RE = re.compile(r'[【】\[\]「」『』（）()<>]')
+_LORA_TAG_RE = re.compile(r'[ \t]*<lora:([^<>]+)>', re.IGNORECASE)
+
+
+def _is_number(s):
+    try:
+        float(s)
+        return True
+    except ValueError:
+        return False
+
+
+def extract_lora_tags(text):
+    """剥离 <lora:名称[:强度[:clip强度]]> 标签 (rgthree Power Prompt 同语法)。
+    返回 (去标签文本, [(名称, 强度), ...])；强度缺省 1.0，clip 强度忽略。无标签时原样返回文本。"""
+    loras = []
+    for body in _LORA_TAG_RE.findall(text):
+        parts = body.split(':')
+        strengths = []
+        while len(parts) > 1 and _is_number(parts[-1]):
+            strengths.insert(0, float(parts.pop()))
+        loras.append((':'.join(parts).strip(), strengths[0] if strengths else 1.0))
+    if not loras:
+        return text, loras
+    return _LORA_TAG_RE.sub('', text).strip(), loras
 
 
 def _parse_tag_line_duration(text):
@@ -747,18 +771,20 @@ def _parse_tag_line_duration(text):
     带括号的先剥括号再解析。
     返回 (duration, remaining_text)，无时长返回 (None, text)
     """
-    cleaned = _TAG_BRACKET_RE.sub('', text).strip()
+    # <lora:> 标签先摘出, 免得剥括号时被破坏, 解析完再接回段内容
+    lora_tags = ' '.join(m.group(0).strip() for m in _LORA_TAG_RE.finditer(text))
+    cleaned = _TAG_BRACKET_RE.sub('', _LORA_TAG_RE.sub('', text)).strip()
 
     m = _TIME_PATTERN.search(cleaned)
     if m:
         start = float(m.group(1))
         end = float(m.group(2))
         remaining = (cleaned[:m.start()] + cleaned[m.end():]).strip()
-        return end - start, remaining
+        return end - start, f"{remaining} {lora_tags}".strip()
 
     m = _TAG_DURATION_PATTERN.match(cleaned)
     if m:
-        return float(m.group(1)), cleaned[m.end():].strip()
+        return float(m.group(1)), f"{cleaned[m.end():].strip()} {lora_tags}".strip()
 
     return None, text
 
