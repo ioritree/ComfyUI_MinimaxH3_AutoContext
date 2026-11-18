@@ -354,6 +354,11 @@ class H3AutoContextSampler(io.ComfyNode):
                             "the output audio is this very track (lip movement/rhythm are driven by it). It may be the same audio as ref_audio_0"
                             "\n音频驱动源 (Audio Drive)。接要锁定的源音频，开启 audio_drive 后 "
                             "输出音频=这条音频本身 (口型/节奏由它驱动)。可与 ref_audio_0 接同一条音频"),
+                io.Conditioning.Input("refmod_conditioning", optional=True,
+                    tooltip="Conditioning carrying RefMod blocks (e.g. any CONDITIONING passed through Apply H3 RefMod). "
+                            "Only its minimax_refs are read and appended to every segment's references"
+                            "\n携带 RefMod 的 conditioning (例如任意 CONDITIONING 经 Apply H3 RefMod 处理后接入)。"
+                            "仅读取其中的 minimax_refs，附加到每一段的参考"),
             ],
             outputs=[
                 io.Latent.Output(display_name="latent"),
@@ -379,7 +384,7 @@ class H3AutoContextSampler(io.ComfyNode):
             ignore_latent_hash=False,
             ref_images=None, ref_videos=None,
             ref_video_audios=None, ref_audios=None,
-            drive_audio=None) -> io.NodeOutput:
+            drive_audio=None, refmod_conditioning=None) -> io.NodeOutput:
                 
         
         try:
@@ -471,6 +476,7 @@ class H3AutoContextSampler(io.ComfyNode):
             ref_video_list.append({"video": vval, "audio": soundtrack})
 
         ref_audio_list = _autogrow_to_list(ref_audios, "ref_audio_", 4)
+        refmod_refs = list(refmod_conditioning[0][1].get("minimax_refs", [])) if refmod_conditioning else []
 
         # ===== 强制清除缓存 =====
         if clear_cache and unique_id is not None:
@@ -506,7 +512,7 @@ class H3AutoContextSampler(io.ComfyNode):
             model=model, vae=vae, audio_vae=audio_vae, clip=clip,
             first_frame=first_frame, last_frame=last_frame,
             ref_images=ref_image_list, ref_videos=ref_video_list,
-            ref_audios=ref_audio_list,
+            ref_audios=ref_audio_list, refmod_refs=refmod_refs,
             long_prompt=long_prompt, width=width, height=height,
             total_frames=total_frames, fps=fps,
             chunk_frames=chunk_frames, context_frames=int(context_frames),

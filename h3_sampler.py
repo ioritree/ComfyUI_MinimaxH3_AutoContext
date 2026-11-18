@@ -509,7 +509,8 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
                                 semantic_bridge=False,
                                 semantic_bridge_adapter="none",
                                 semantic_bridge_alpha=0.10,
-                                semantic_bridge_magnitude="per_token"):
+                                semantic_bridge_magnitude="per_token",
+                                refmod_refs=None):
     h3_patches.apply_patches()
 
     device = comfy.model_management.get_torch_device()
@@ -876,6 +877,7 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
             first_frame if is_first_chunk else None,
             last_frame if is_last_chunk else None,
             seg_ref_aud,
+            refmod_refs,
         )
     
         # ----- 筛选属于当前段的外部 Keyframes -----
@@ -906,6 +908,8 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
             last_frame_pixel=last_frame if is_last_chunk else None,
             external_keyframes=seg_external_kfs,
         )
+        if refmod_refs:
+            payload["refs"] = payload["refs"] + refmod_refs
     
         positive = h3_conditioning.encode_text_with_references(
             clip, window_prompt, payload["ref_items_for_clip"], device,
@@ -1234,7 +1238,8 @@ def _prepare_ref_images(ref_images, vae, device, gen_w, gen_h, crop_mode="stretc
             result.append({"pixel": resized, "latent": lat})
     return result
 
-def _compute_conditions_hash(ref_img_data, ref_vid_data, first_frame=None, last_frame=None, ref_aud_data=None):
+def _compute_conditions_hash(ref_img_data, ref_vid_data, first_frame=None, last_frame=None, ref_aud_data=None,
+                             refmod_refs=None):
     """
     计算当前段实际使用的所有外部输入条件（像素）的指纹哈希。
     只对当前段真正用到的素材取指纹，避免跨段误判。
@@ -1243,7 +1248,7 @@ def _compute_conditions_hash(ref_img_data, ref_vid_data, first_frame=None, last_
     """
     hasher = hashlib.md5()
 
-    if not ref_img_data and not ref_vid_data and not ref_aud_data \
+    if not ref_img_data and not ref_vid_data and not ref_aud_data and not refmod_refs \
             and first_frame is None and last_frame is None:
         return "no_external_conditions"
 
@@ -1267,6 +1272,11 @@ def _compute_conditions_hash(ref_img_data, ref_vid_data, first_frame=None, last_
         wav = (aud_data.get("audio_dict") or {}).get("waveform")
         if torch.is_tensor(wav) and wav.shape[-1] > 0:
             hasher.update(latent_cache.tensor_sig(wav, 2048).encode())
+
+    for ref in (refmod_refs or []):
+        for key in ("latent", "audio_latent"):
+            if torch.is_tensor(ref.get(key)):
+                hasher.update(latent_cache.tensor_sig(ref[key], 2048).encode())
 
     return hasher.hexdigest()
 
