@@ -34,6 +34,7 @@ v2 优化版变更 (输出不变项 / 行为变化项分开列出):
 
 import math
 import os
+import sys
 import re
 import torch
 import folder_paths
@@ -1206,6 +1207,27 @@ def _apply_loras(model, loras, lora_files):
             lora_files[path] = comfy.utils.load_torch_file(path, safe_load=True, return_metadata=True)
         lora, metadata = lora_files[path]
         model, _ = comfy.sd.load_lora_for_models(model, None, lora, strength, 0, lora_metadata=metadata)
+    return _port_curve_adaln(model) if loras else model
+
+
+def _port_curve_adaln(model):
+    """curve (剪枝) H3 底模的 adaln_proj 是 [N, 8], dense 训练的 LoRA 是 2688 宽, 原生加载会报 shape 错并跳过。
+    装了 ComfyUI-H3-PowerLoraStack 时借用它把已挂上的 dense adaLN patch 换算到 curve 基底。"""
+    adaln = next((m for n, m in list(sys.modules.items()) if n.endswith(".h3lora.adaln") and hasattr(m, "port_attached_patches")), None)
+    sidecars = sys.modules.get(adaln.__name__[:-len("adaln")] + "sidecars") if adaln is not None else None
+    if sidecars is None:
+        return model
+    diffusion_model = model.get_model_object("diffusion_model")
+    target_dim, table = adaln.read_target(diffusion_model)
+    if table is None:
+        return model
+    ctx = adaln.AdalnContext(target_dim, table, adaln.find_silu_grid(),
+                             sidecars=sidecars.collect(model, diffusion_model),
+                             time_embedder=getattr(diffusion_model, "time_embedder", None))
+    model, stats = adaln.port_attached_patches(model, ctx)
+    if stats["ported"] or stats["stripped"] or stats["unportable"]:
+        print(f"[H3-Auto] curve adaLN: ported {stats['ported']}, stripped {stats['stripped']}, unportable {stats['unportable']} "
+              f"(PowerLoraStack){' ' + '; '.join(stats['notes'][:3]) if stats['notes'] else ''}")
     return model
 
 
